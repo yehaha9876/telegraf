@@ -51,6 +51,7 @@ type InsertKey struct {
 
 type InsertItem struct {
 	TableName string
+  Names     []string
 	Columns   []string
 	Values    []interface{}
 	Types     map[string]string
@@ -97,7 +98,6 @@ func (p *Postgresql) Connect() error {
 
 func PostgreSQL_Copy(txn *sql.Tx, insertItem InsertItem) error {
 	query := pq.CopyIn(insertItem.TableName, insertItem.Columns...)
-	log.Println("ERROR: query: ", query)
 	stmt, err := txn.Prepare(query)
 	if err != nil {
 		log.Println("ERROR: [txn.Prepare]: ", err)
@@ -366,20 +366,22 @@ func (p *Postgresql) generateCreateTable(metric telegraf.Metric) string {
 	if p.FieldsAsJsonb {
 		columns = append(columns, "fields jsonb")
 	} else {
-		var datatype string
-		for column, v := range metric.Fields() {
-			datatype = deriveDatatype(v)
-			columns = append(columns, fmt.Sprintf("%s %s", quoteIdent(column), datatype))
-		}
+		columns = append(columns, "name varchar")
+    columns = append(columns, "value float")
+		//var datatype string
+		//for column, v := range metric.Fields() {
+		//	datatype = deriveDatatype(v)
+		//	columns = append(columns, fmt.Sprintf("%s %s", quoteIdent(column), datatype))
+		//}
 	}
 
-	query := strings.Replace(p.TableTemplate, "{TABLE}", quoteIdent(metric.Name()), -1)
-	query = strings.Replace(query, "{TABLELITERAL}", quoteLiteral("\""+metric.Name()+"\""), -1)
+	query := strings.Replace(p.TableTemplate, "{TABLE}", "metrics", -1)
+	query = strings.Replace(query, "{TABLELITERAL}", quoteLiteral("\"metrics\""), -1)
 	query = strings.Replace(query, "{COLUMNS}", strings.Join(columns, ","), -1)
 	query = strings.Replace(query, "{KEY_COLUMNS}", strings.Join(pk, ","), -1)
 
 	sql = append(sql, query)
-  log.Println("ERROR: ", strings.Join(sql, ";"))
+  log.Printf("D! create sql: %s ", strings.Join(sql, ";"))
 	return strings.Join(sql, ";")
 }
 
@@ -447,12 +449,12 @@ func (p *Postgresql) tableExists(tableName string) bool {
 	return false
 }
 
-func (p *Postgresql) getInsertKey(timestamp time.Time, tags map[string]string) string {
+func (p *Postgresql) getInsertKey(timestamp time.Time, tags map[string]string, filename string) string {
 	ret := fmt.Sprintf("%d", timestamp.UTC().UnixNano())
-	tagArray := make([]string, len(p.TagKey))
+	tagArray := make([]string, len(tags))
 	i := 0
-	for _, key := range p.TagKey {
-		kvStr := key + "=" + tags[key]
+	for key, val := range tags {
+		kvStr := key + "=" + val
 		tagArray[i] = kvStr
 		i++
 	}
@@ -460,7 +462,7 @@ func (p *Postgresql) getInsertKey(timestamp time.Time, tags map[string]string) s
 	for _, val := range tagArray {
 		ret += "," + val
 	}
-	return ret
+	return ret + "," + filename
 }
 
 func (p *Postgresql) WriteMetrics(id int) {
@@ -486,12 +488,8 @@ func (p *Postgresql) WriteMetrics(id int) {
 
 		for _, metric := range metrics {
 
-			tablename := metric.Name()
-
-			// Don't process items that are in the exclude list
-			if contains(p.Exclude, tablename) {
-				continue
-			}
+      log.Printf("D! output get metric %v", metric)
+			tablename := "metrics"
 
 			if _, ok := tableItems[tablename]; !ok {
 				tableItems[tablename] = make(map[string]InsertItem)
@@ -500,12 +498,12 @@ func (p *Postgresql) WriteMetrics(id int) {
 
 			// create table if needed
 			if p.Tables[tablename] == false && p.tableExists(tablename) == false {
-        log.Printf("generate table")
+        log.Printf("I! generate table")
 
 				createStmt := p.generateCreateTable(metric)
 				_, err := p.db.Exec(createStmt)
 				if err != nil {
-					log.Println("ERROR: ", err)
+					log.Println("E! generate table error: ", err)
 				}
 				p.inputMutex.Lock()
 				p.Tables[tablename] = true
@@ -520,118 +518,47 @@ func (p *Postgresql) WriteMetrics(id int) {
 			}
 
 			var js map[string]interface{}
-			insertKey := p.getInsertKey(timestamp, metric.Tags())
-			if _, ok := insertItems[insertKey]; !ok {
+
+      var tag_str []byte
+			if len(metric.Tags()) > 0 {
+				js = make(map[string]interface{})
+				for column, value := range metric.Tags() {
+					js[column] = value
+				}
+
+				if len(js) > 0 {
+					d, err := json.Marshal(js)
+					if err != nil {
+					  log.Println("E! marshal tag json error: ", err)
+					}
+          tag_str = d
+				}
+			}
+
+      for file_name, file_val := range metric.Fields() {
+				insertKey := p.getInsertKey(timestamp, metric.Tags(), file_name)
+				if _, ok := insertItems[insertKey]; ok {
+          log.Printf("D! dorp metrice %v for same key %v", metric, insertKey)
+          continue
+        }
+
 				var newItem InsertItem
 				newItem.Columns = append(newItem.Columns, "time")
 				newItem.Values = append(newItem.Values, timestamp)
 				newItem.Types = make(map[string]string)
 
-				if len(metric.Tags()) > 0 {
-					if p.TagsAsForeignkeys {
-						// tags in separate table
-						var tag_id int
-						var where_columns []string
-						var where_values []interface{}
+				newItem.Columns = append(newItem.Columns, "tags")
+				newItem.Values = append(newItem.Values, tag_str)
 
-						if p.TagsAsJsonb {
-							js = make(map[string]interface{})
-							for column, value := range metric.Tags() {
-								js[column] = value
-							}
+				newItem.Columns = append(newItem.Columns, "name")
+				newItem.Values = append(newItem.Values, metric.Name() + "." + file_name)
 
-							if len(js) > 0 {
-								d, err := json.Marshal(js)
-								if err != nil {
-									log.Println("ERROR: ", err)
-								}
+				newItem.Columns = append(newItem.Columns, "value")
+				newItem.Values = append(newItem.Values, file_val)
 
-								where_columns = append(where_columns, "tags")
-								where_values = append(where_values, d)
-							}
-						} else {
-							for column, value := range metric.Tags() {
-								where_columns = append(where_columns, column)
-								where_values = append(where_values, value)
-								newItem.Types[column] = "text"
-							}
-						}
-
-						var where_parts []string
-						for i, column := range where_columns {
-							where_parts = append(where_parts, fmt.Sprintf("%s = $%d", quoteIdent(column), i+1))
-						}
-						query := fmt.Sprintf("SELECT tag_id FROM %s WHERE %s", quoteIdent(tablename+p.TagTableSuffix), strings.Join(where_parts, " AND "))
-
-						err := p.db.QueryRow(query, where_values...).Scan(&tag_id)
-						if err != nil {
-							// log.Printf("I! Foreign key reference not found %s: %v", tablename, err)
-							query := p.generateInsert(tablename+p.TagTableSuffix, where_columns) + " RETURNING tag_id"
-							err := p.db.QueryRow(query, where_values...).Scan(&tag_id)
-							if err != nil {
-								log.Println("ERROR: ", err)
-							}
-						}
-
-						newItem.Columns = append(newItem.Columns, "tag_id")
-						newItem.Values = append(newItem.Values, tag_id)
-					} else {
-						// tags in measurement table
-						if p.TagsAsJsonb {
-							js = make(map[string]interface{})
-							for column, value := range metric.Tags() {
-								js[column] = value
-							}
-
-							if len(js) > 0 {
-								d, err := json.Marshal(js)
-								if err != nil {
-									log.Println("ERROR: ", err)
-								}
-
-								newItem.Columns = append(newItem.Columns, "tags")
-								newItem.Values = append(newItem.Values, d)
-							}
-						} else {
-							for column, value := range metric.Tags() {
-								newItem.Columns = append(newItem.Columns, column)
-								newItem.Values = append(newItem.Values, value)
-								newItem.Types[column] = "text"
-							}
-						}
-					}
-				}
-
-				insertItems[insertKey] = newItem
-			}
-
-			insertItem := insertItems[insertKey]
-
-			if p.FieldsAsJsonb {
-				js = make(map[string]interface{})
-				for column, value := range metric.Fields() {
-					js[column] = value
-				}
-
-				d, err := json.Marshal(js)
-				if err != nil {
-					log.Println("ERROR: ", err)
-				}
-
-				insertItem.Columns = append(insertItem.Columns, "fields")
-				insertItem.Values = append(insertItem.Values, d)
-			} else {
-				for column, value := range metric.Fields() {
-					if !contains(insertItem.Columns, column) {
-						insertItem.Columns = append(insertItem.Columns, column)
-						insertItem.Values = append(insertItem.Values, value)
-						insertItem.Types[column] = deriveDatatype(value)
-					}
-				}
-			}
-
-			insertItem.TableName = tablename
-			tableItems[tablename][insertKey] = insertItem
+				newItem.TableName = tablename
+				tableItems[tablename][insertKey] = newItem
+      }
 		}
 
 		for _, insertItems := range tableItems {
@@ -653,7 +580,6 @@ func (p *Postgresql) WriteMetrics(id int) {
 
 func (p *Postgresql) Write(metrics []telegraf.Metric) error {
 	//p.inputMutex.Lock()
-
 	p.inputQueue <- metrics
 	//p.inputMutex.Unlock()
 	return nil
@@ -668,9 +594,9 @@ func newPostgresql() *Postgresql {
 		TableTemplate:  "CREATE TABLE {TABLE}({COLUMNS})",
 		TagsAsJsonb:    true,
 		TagTableSuffix: "_tag",
-		FieldsAsJsonb:  true,
+		FieldsAsJsonb:  false,
     Connections: 1,
-    MaxItems: 1,
+    MaxItems: 500,
     Strategy: "copy",
 	}
 }
